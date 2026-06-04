@@ -2,6 +2,23 @@
 
 Telegram group moderation bot with admin-controlled URL blocking, keyword alerts, and EVM address detection.
 
+## Spark Domain Chips
+
+The project includes Spark specialist advisory chips:
+
+- `social-reputation-advisor` evaluates opt-in social reputation signals.
+- It requires privacy controls, explicit consent, anti-bias checks, and evidence provenance.
+- It returns advisory bands only and must not make automated punitive decisions.
+- `spark-runtime-log-context-advisor` keeps Spark grounded when a user asks for stdout,
+  stderr, run logs, diagnostics, or command output.
+- It requires Spark to distinguish requested logs from Mission Control URLs and
+  diagnostic-note paths before answering.
+- It blocks generic Mission Control guidance from being substituted for a stdout/log request.
+
+Register chips from `security_bot.spark_chips.SPARK_DOMAIN_CHIPS` or fetch them by slug with
+`get_spark_domain_chip("social-reputation-advisor")` and
+`get_spark_domain_chip("spark-runtime-log-context-advisor")`.
+
 ## Setup
 
 ```powershell
