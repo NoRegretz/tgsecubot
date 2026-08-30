@@ -40,6 +40,9 @@ For private alerts, each recipient must open the bot in Telegram and send `/star
 - `/warningtxt message` sets the warning message text.
 - `/warningfreq seconds` sets how often the warning is sent. Default: 600 seconds.
 - `/warnmedia` adds media to warning messages by replying to an image, GIF, or video.
+- `/setfilter keyword` saves an exact-match auto-response by replying to a message.
+- `/listfilter` lists saved auto-response filters.
+- `/delfilter keyword` deletes a saved auto-response filter.
 
 Group admins are always allowed to send URLs. Only group admins can change bot settings.
 
@@ -58,3 +61,11 @@ Before each scheduled warning is posted, the bot deletes the previous warning me
 Second line
 Third line
 ```
+
+Filters work like simple Rose-style saved answers. Send the answer message first, then reply to it with:
+
+```text
+/setfilter CA
+```
+
+After that, when someone sends exactly `CA`, `ca`, `Ca`, or `/CA`, the bot replies with the saved answer. Filter setup is admin-only. Saved filter answers preserve text formatting and supported media.

@@ -15,6 +15,15 @@ class Recipient:
 
 
 @dataclass
+class SavedFilter:
+    keyword: str
+    text: str = ""
+    entities: list[dict[str, object]] = field(default_factory=list)
+    media_type: str | None = None
+    media_file_id: str | None = None
+
+
+@dataclass
 class ChatSettings:
     url_enabled: bool = False
     alert_enabled: bool = False
@@ -30,6 +39,7 @@ class ChatSettings:
     allowed_urls: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
     recipients: dict[str, Recipient] = field(default_factory=dict)
+    filters: dict[str, SavedFilter] = field(default_factory=dict)
     known_names: dict[str, str] = field(default_factory=dict)
 
 
@@ -71,6 +81,10 @@ class SettingsStore:
                 username: Recipient(**recipient)
                 for username, recipient in value.get("recipients", {}).items()
             }
+            saved_filters = {
+                keyword: SavedFilter(**saved_filter)
+                for keyword, saved_filter in value.get("filters", {}).items()
+            }
             self._data[chat_id] = ChatSettings(
                 url_enabled=bool(value.get("url_enabled", False)),
                 alert_enabled=bool(value.get("alert_enabled", False)),
@@ -86,5 +100,6 @@ class SettingsStore:
                 allowed_urls=list(value.get("allowed_urls", [])),
                 keywords=list(value.get("keywords", [])),
                 recipients=recipients,
+                filters=saved_filters,
                 known_names=dict(value.get("known_names", {})),
             )

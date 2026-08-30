@@ -24,7 +24,7 @@ from .moderation import (
     name_matches_keywords,
     normalize_domain,
 )
-from .storage import Recipient, SettingsStore
+from .storage import Recipient, SavedFilter, SettingsStore
 
 
 LOGGER = logging.getLogger(__name__)
@@ -47,7 +47,10 @@ ADMIN_COMMANDS_TEXT = """Admin Commands:
 /warningmsg ON|OFF - enable or disable scheduled warning messages. Default: OFF.
 /warningtxt message - set the warning message text.
 /warningfreq seconds - set the warning interval in seconds. Default: 600.
-/warnmedia - reply to an image, GIF, or video to attach it to warning messages."""
+/warnmedia - reply to an image, GIF, or video to attach it to warning messages.
+/setfilter keyword - reply to a message to save an exact-match auto-response.
+/listfilter - list saved auto-response filters.
+/delfilter keyword - delete a saved auto-response filter."""
 
 
 def _username_key(value: str) -> str:
@@ -118,6 +121,12 @@ def _warning_entities(context: ContextTypes.DEFAULT_TYPE, settings) -> list[Mess
     if not settings.warning_entities:
         return None
     return [MessageEntity.de_json(entity, context.bot) for entity in settings.warning_entities]
+
+
+def _saved_entities(context: ContextTypes.DEFAULT_TYPE, entities: list[dict[str, object]]) -> list[MessageEntity] | None:
+    if not entities:
+        return None
+    return [MessageEntity.de_json(entity, context.bot) for entity in entities]
 
 
 async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -470,6 +479,199 @@ async def warnmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text("Media has been added.")
 
 
+def _filter_key(value: str) -> str:
+    normalized = value.strip()
+    if normalized.startswith("/"):
+        normalized = normalized[1:]
+        normalized = normalized.split(maxsplit=1)[0]
+        normalized = normalized.split("@", 1)[0]
+    return normalized.casefold()
+
+
+def _message_entities_to_dict(entities) -> list[dict[str, object]]:
+    return [entity.to_dict() for entity in entities or []]
+
+
+def _saved_filter_from_message(keyword: str, message) -> SavedFilter | None:
+    media = _extract_warning_media(message)
+    if message.text:
+        return SavedFilter(
+            keyword=keyword,
+            text=message.text,
+            entities=_message_entities_to_dict(message.entities),
+        )
+    if media is not None:
+        media_type, file_id = media
+        return SavedFilter(
+            keyword=keyword,
+            text=message.caption or "",
+            entities=_message_entities_to_dict(message.caption_entities),
+            media_type=media_type,
+            media_file_id=file_id,
+        )
+    if message.caption:
+        return SavedFilter(
+            keyword=keyword,
+            text=message.caption,
+            entities=_message_entities_to_dict(message.caption_entities),
+        )
+    return None
+
+
+async def setfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await message.reply_text("Usage: /setfilter keyword")
+        return
+    if message.reply_to_message is None:
+        await message.reply_text("Reply to the message you want the bot to save, then send /setfilter keyword.")
+        return
+    saved_filter = _saved_filter_from_message(keyword, message.reply_to_message)
+    if saved_filter is None:
+        await message.reply_text("That replied message has no supported text or media to save.")
+        return
+    settings = _store(context).chat(chat.id)
+    settings.filters[_filter_key(keyword)] = saved_filter
+    _store(context).save()
+    await message.reply_text(f"Filter saved: {keyword}")
+
+
+async def delfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    keyword = " ".join(context.args).strip()
+    if not keyword:
+        await message.reply_text("Usage: /delfilter keyword")
+        return
+    settings = _store(context).chat(chat.id)
+    removed = settings.filters.pop(_filter_key(keyword), None)
+    if removed is None:
+        await message.reply_text(f"Filter not found: {keyword}")
+        return
+    _store(context).save()
+    await message.reply_text(f"Filter deleted: {removed.keyword}")
+
+
+async def listfilter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update, context):
+        return
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return
+    saved_filters = sorted(
+        _store(context).chat(chat.id).filters.values(),
+        key=lambda saved_filter: saved_filter.keyword.casefold(),
+    )
+    if not saved_filters:
+        await message.reply_text("No filters are configured.")
+        return
+    await message.reply_text("Filters:\n" + "\n".join(saved_filter.keyword for saved_filter in saved_filters))
+
+
+async def _send_filter_response(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    trigger_message_id: int,
+    saved_filter: SavedFilter,
+) -> None:
+    text = saved_filter.text or None
+    entities = _saved_entities(context, saved_filter.entities) if text else None
+    if not saved_filter.media_file_id:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text or "",
+            entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+        return
+    if saved_filter.media_type == "photo":
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=saved_filter.media_file_id,
+            caption=text,
+            caption_entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+    elif saved_filter.media_type == "animation":
+        await context.bot.send_animation(
+            chat_id=chat_id,
+            animation=saved_filter.media_file_id,
+            caption=text,
+            caption_entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+    elif saved_filter.media_type == "video":
+        await context.bot.send_video(
+            chat_id=chat_id,
+            video=saved_filter.media_file_id,
+            caption=text,
+            caption_entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+    elif saved_filter.media_type == "document":
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=saved_filter.media_file_id,
+            caption=text,
+            caption_entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text or "",
+            entities=entities,
+            reply_to_message_id=trigger_message_id,
+            allow_sending_without_reply=True,
+        )
+
+
+async def _maybe_send_filter_response(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    chat = update.effective_chat
+    message = update.effective_message
+    if chat is None or message is None:
+        return False
+    text = (message.text or "").strip()
+    if not text:
+        return False
+    saved_filter = _store(context).chat(chat.id).filters.get(_filter_key(text))
+    if saved_filter is None:
+        return False
+    try:
+        await _send_filter_response(context, chat.id, message.message_id, saved_filter)
+    except TelegramError:
+        LOGGER.exception("Unable to send filter response for %s in chat %s", saved_filter.keyword, chat.id)
+    return True
+
+
+async def handle_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    message = update.effective_message
+    user = update.effective_user
+    if chat is None or message is None or user is None or chat.type == Chat.PRIVATE:
+        return
+    if user.username:
+        context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
+    await _handle_name_seen(update, context, user, is_join=False)
+    await _maybe_send_filter_response(update, context)
+
+
 async def send_warning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     job = context.job
     if job is None or job.data is None:
@@ -768,6 +970,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user.username:
         context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
     await _handle_name_seen(update, context, user, is_join=False)
+    if await _maybe_send_filter_response(update, context):
+        return
 
     settings = _store(context).chat(chat.id)
     if await _is_group_admin(update, context):
@@ -798,6 +1002,9 @@ def build_application(token: str, data_file: Path) -> Application:
     app.add_handler(CommandHandler("warningtxt", warningtxt))
     app.add_handler(CommandHandler("warningfreq", warningfreq))
     app.add_handler(CommandHandler("warnmedia", warnmedia))
+    app.add_handler(CommandHandler("setfilter", setfilter))
+    app.add_handler(CommandHandler("delfilter", delfilter))
+    app.add_handler(CommandHandler("listfilter", listfilter))
     app.add_handler(CommandHandler("addurl", addurl))
     app.add_handler(CommandHandler("listurl", listurl))
     app.add_handler(CommandHandler("delurl", delurl))
@@ -809,6 +1016,7 @@ def build_application(token: str, data_file: Path) -> Application:
     app.add_handler(CommandHandler("listreceiver", listrecipient))
     app.add_handler(CommandHandler("scandelacc", scandeletedaccounts))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, handle_new_members))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & filters.COMMAND, handle_filter_command))
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     if app.job_queue is not None:
