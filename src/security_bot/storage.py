@@ -24,11 +24,23 @@ class SavedFilter:
 
 
 @dataclass
+class PendingCaptcha:
+    user_id: int
+    token: str
+    message_id: int
+    expires_at: int
+
+
+@dataclass
 class ChatSettings:
     url_enabled: bool = False
     alert_enabled: bool = False
     delca_enabled: bool = False
     sendca_enabled: bool = False
+    clear_events_enabled: bool = False
+    captcha_enabled: bool = False
+    captcha_timeout_seconds: int = 60
+    captcha_mode: str = "button"
     warning_enabled: bool = False
     warning_text: str = ""
     warning_entities: list[dict[str, object]] = field(default_factory=list)
@@ -41,6 +53,7 @@ class ChatSettings:
     recipients: dict[str, Recipient] = field(default_factory=dict)
     filters: dict[str, SavedFilter] = field(default_factory=dict)
     known_names: dict[str, str] = field(default_factory=dict)
+    pending_captchas: dict[str, PendingCaptcha] = field(default_factory=dict)
 
 
 class SettingsStore:
@@ -85,11 +98,19 @@ class SettingsStore:
                 keyword: SavedFilter(**saved_filter)
                 for keyword, saved_filter in value.get("filters", {}).items()
             }
+            pending_captchas = {
+                user_id: PendingCaptcha(**captcha)
+                for user_id, captcha in value.get("pending_captchas", {}).items()
+            }
             self._data[chat_id] = ChatSettings(
                 url_enabled=bool(value.get("url_enabled", False)),
                 alert_enabled=bool(value.get("alert_enabled", False)),
                 delca_enabled=bool(value.get("delca_enabled", False)),
                 sendca_enabled=bool(value.get("sendca_enabled", False)),
+                clear_events_enabled=bool(value.get("clear_events_enabled", False)),
+                captcha_enabled=bool(value.get("captcha_enabled", False)),
+                captcha_timeout_seconds=max(10, int(value.get("captcha_timeout_seconds", 60))),
+                captcha_mode="button",
                 warning_enabled=bool(value.get("warning_enabled", False)),
                 warning_text=str(value.get("warning_text", "")),
                 warning_entities=list(value.get("warning_entities", [])),
@@ -102,4 +123,5 @@ class SettingsStore:
                 recipients=recipients,
                 filters=saved_filters,
                 known_names=dict(value.get("known_names", {})),
+                pending_captchas=pending_captchas,
             )

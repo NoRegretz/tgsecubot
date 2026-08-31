@@ -36,6 +36,10 @@ For private alerts, each recipient must open the bot in Telegram and send `/star
 - `/scandelacc` scans known group members and removes deleted Telegram accounts.
 - `/delca ON|OFF` removes users when they join with an EVM-like address in their displayed name. Default: OFF.
 - `/sendca ON|OFF` deletes messages containing EVM-like addresses. Default: OFF.
+- `/clearevents ON|OFF` deletes Telegram join and leave service messages. Default: OFF.
+- `/captcha ON|OFF` requires new members to verify with a button. Default: OFF.
+- `/captchatime seconds` sets the CAPTCHA verification time. Default: 60 seconds.
+- `/captchamode button` sets the CAPTCHA mode. Button is currently the only mode.
 - `/warningmsg ON|OFF` enables or disables scheduled warning messages. Default: OFF.
 - `/warningtxt message` sets the warning message text.
 - `/warningfreq seconds` sets how often the warning is sent. Default: 600 seconds.
@@ -45,6 +49,10 @@ For private alerts, each recipient must open the bot in Telegram and send `/star
 - `/delfilter keyword` deletes a saved auto-response filter.
 
 Group admins are always allowed to send URLs. Only group admins can change bot settings.
+
+`/clearevents ON` removes join and leave notices that Telegram sends to the bot, including CAPTCHA timeout removal notices.
+
+When CAPTCHA is enabled, new non-admin, non-bot members are muted and receive this message with their Telegram first name: `Hello {first}! Welcome to the community! Please click the button below within 60 seconds to join, otherwise you will be kicked!` They also receive a `Tap to join!` button. The displayed number of seconds follows `/captchatime`. They are restored after pressing their own button; users who do not verify before the configured time are removed. The bot must be a group admin with permission to restrict members and ban users, as well as delete messages if you want it to clean up verification messages.
 
 Keyword alerts trigger on joins, on messages from a user whose display name changed, and on a periodic scan of users the bot has already seen in the group. The scan interval defaults to 60 seconds and can be changed with `SECURITY_BOT_NAME_SCAN_SECONDS`.
 
