@@ -29,6 +29,8 @@ class PendingCaptcha:
     token: str
     message_id: int
     expires_at: int
+    phase: str = "waiting"
+    retry_count: int = 0
 
 
 @dataclass

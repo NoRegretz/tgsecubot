@@ -54,6 +54,10 @@ Group admins are always allowed to send URLs. Only group admins can change bot s
 
 When CAPTCHA is enabled, new non-admin, non-bot members are muted and receive this message with their Telegram first name: `Hello {first}! Welcome to the community! Please click the button below within 60 seconds to join, otherwise you will be kicked!` They also receive a `Tap to join!` button. The displayed number of seconds follows `/captchatime`. They are restored after pressing their own button; users who do not verify before the configured time are removed. The bot must be a group admin with permission to restrict members and ban users, as well as delete messages if you want it to clean up verification messages.
 
+CAPTCHA timeout removals save unfinished unban actions in the settings file and retry until a membership lookup confirms the user is no longer banned. Retries start at 10 seconds and increase to 5 minutes; longer Telegram rate-limit delays are respected. Recovery resumes after a restart. Overdue CAPTCHA jobs remain eligible to run, and a watchdog checks every 15 seconds for saved actions missing their jobs. At most three members' timeout/recovery workflows run simultaneously, with duplicate processing prevented for the same member. During a burst, removals and retries may therefore run later than their target time.
+
+When updating a VPS, install the updated files and restart the bot using the same settings data file (`SECURITY_BOT_DATA` or `--data-file`). Only recorded CAPTCHA actions are recovered; the bot does not scan the banned list to unban unrelated users. Bans left by versions that discarded the recovery record need manual attention.
+
 Keyword alerts trigger on joins, on messages from a user whose display name changed, and on a periodic scan of users the bot has already seen in the group. The scan interval defaults to 60 seconds and can be changed with `SECURITY_BOT_NAME_SCAN_SECONDS`.
 
 `/scandelacc` can only scan users the bot already knows from joins or messages. Telegram Bot API does not provide bots with a full group member list.

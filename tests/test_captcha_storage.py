@@ -36,9 +36,15 @@ def test_pending_captcha_survives_store_reload(tmp_path):
 
 
 def test_captcha_welcome_text_uses_first_name_and_configured_timeout():
-    user = User(id=42, first_name="Alex", is_bot=False)
+    user = User(id=42, first_name="Alex", username="alex_user", is_bot=False)
 
     assert _captcha_welcome_text(user, 60) == (
-        "Hello Alex! Welcome to the community! Please click the button below within "
+        "Hello Alex (@alex_user)! Welcome to the community! Please click the button below within "
         "60 seconds to join, otherwise you will be kicked!"
     )
+
+
+def test_captcha_welcome_text_uses_only_first_name_without_username():
+    user = User(id=42, first_name="Alex", is_bot=False)
+
+    assert _captcha_welcome_text(user, 60).startswith("Hello Alex! ")

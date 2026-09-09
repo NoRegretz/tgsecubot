@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import os
@@ -10,7 +11,7 @@ import time
 
 from telegram import Chat, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update, User
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError
+from telegram.error import BadRequest, Forbidden, TelegramError, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -33,6 +34,8 @@ from .storage import PendingCaptcha, Recipient, SavedFilter, SettingsStore
 
 
 LOGGER = logging.getLogger(__name__)
+CAPTCHA_RECOVERY_INTERVAL_SECONDS = 15
+CAPTCHA_MAX_CONCURRENT_RECOVERIES = 3
 ADMIN_STATUSES = {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
 ADMIN_COMMANDS_TEXT = """Admin Commands:
 /url ON|OFF - enable or disable URL restriction. Default: OFF.
@@ -91,6 +94,11 @@ def _alert_user_label(user: User) -> str:
     return f"{escaped_name} ({escape_html(username)})"
 
 
+def _alert_with_group(message_html: str, group_title: str | None) -> str:
+    title = escape_html(group_title or "Unnamed group")
+    return f"{message_html}\n\nGroup: <b>{title}</b>"
+
+
 def _looks_like_deleted_account(user: User) -> bool:
     return user.first_name == "Deleted Account" and not user.last_name and not user.username
 
@@ -117,8 +125,11 @@ def _captcha_permissions() -> ChatPermissions:
 
 def _captcha_welcome_text(user: User, timeout_seconds: int) -> str:
     first_name = escape_html(user.first_name or "there")
+    user_label = first_name
+    if user.username:
+        user_label = f"{first_name} ({escape_html('@' + user.username)})"
     return (
-        f"Hello {first_name}! Welcome to the community! Please click the button below within "
+        f"Hello {user_label}! Welcome to the community! Please click the button below within "
         f"{timeout_seconds} seconds to join, otherwise you will be kicked!"
     )
 
@@ -872,7 +883,13 @@ def _schedule_captcha_timeout(
     token: str,
     expires_at: int,
 ) -> None:
-    job_queue = context.application.job_queue
+    _enqueue_captcha_timeout(context.application, chat_id, user_id, token, expires_at)
+
+
+def _enqueue_captcha_timeout(
+    app: Application, chat_id: int, user_id: int, token: str, expires_at: int,
+) -> None:
+    job_queue = app.job_queue
     if job_queue is None:
         LOGGER.warning("Job queue is unavailable; CAPTCHA timeout cannot be scheduled.")
         return
@@ -885,6 +902,7 @@ def _schedule_captcha_timeout(
         when=seconds_remaining,
         name=name,
         data={"chat_id": chat_id, "user_id": user_id, "token": token},
+        job_kwargs={"misfire_grace_time": None},
     )
 
 
@@ -895,6 +913,26 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = int(job.data["chat_id"])
     user_id = int(job.data["user_id"])
     token = str(job.data["token"])
+    # Reserve the member before waiting for capacity so the watchdog cannot duplicate work.
+    active = context.application.bot_data.setdefault("captcha_active", set())
+    key = (chat_id, user_id)
+    if key in active:
+        return
+    active.add(key)
+    limit = context.application.bot_data.get("captcha_recovery_limit")
+    if limit is None:
+        limit = asyncio.Semaphore(CAPTCHA_MAX_CONCURRENT_RECOVERIES)
+        context.application.bot_data["captcha_recovery_limit"] = limit
+    try:
+        async with limit:
+            await _process_captcha_timeout(context, chat_id, user_id, token)
+    finally:
+        active.discard(key)
+
+
+async def _process_captcha_timeout(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, token: str,
+) -> None:
     store = _store(context)
     settings = store.chat(chat_id)
     pending = settings.pending_captchas.get(_captcha_key(user_id))
@@ -903,13 +941,39 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     if pending.expires_at > int(time.time()):
         _schedule_captcha_timeout(context, chat_id, user_id, token, pending.expires_at)
         return
-    del settings.pending_captchas[_captcha_key(user_id)]
-    store.save()
+    if pending.phase == "verifying":
+        _schedule_captcha_timeout(context, chat_id, user_id, token, int(time.time()) + 10)
+        return
+    if pending.phase == "waiting":
+        # Persist before banning: an interrupted/ambiguous request must recover by unbanning.
+        pending.phase = "unban"
+        store.save()
+        try:
+            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
+        except TelegramError:
+            LOGGER.exception("CAPTCHA ban failed or is uncertain for user %s in chat %s; attempting unban", user_id, chat_id)
     try:
-        await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-    except TelegramError:
-        LOGGER.exception("Unable to remove unverified user %s from chat %s", user_id, chat_id)
+        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        LOGGER.info("CAPTCHA post-unban status for user %s in chat %s: %s", user_id, chat_id, member.status)
+        if member.status == ChatMemberStatus.BANNED:
+            raise TelegramError("User remains banned after unban request; retaining CAPTCHA recovery")
+    except TelegramError as exc:
+        if settings.pending_captchas.get(_captcha_key(user_id)) is not pending:
+            return
+        pending.retry_count += 1
+        delay = min(10 * 2 ** min(pending.retry_count - 1, 5), 300)
+        if isinstance(exc, RetryAfter):
+            retry_after = exc.retry_after
+            delay = max(delay, int(retry_after.total_seconds() if isinstance(retry_after, timedelta) else retry_after) + 1)
+        pending.expires_at = int(time.time()) + delay
+        store.save()
+        _schedule_captcha_timeout(context, chat_id, user_id, token, pending.expires_at)
+        LOGGER.exception("CAPTCHA unban failed for user %s in chat %s; retry in %s seconds", user_id, chat_id, delay)
+    else:
+        if settings.pending_captchas.get(_captcha_key(user_id)) is pending:
+            del settings.pending_captchas[_captcha_key(user_id)]
+            store.save()
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=pending.message_id)
     except TelegramError:
@@ -921,15 +985,37 @@ def _schedule_all_captcha_timeouts(app: Application) -> None:
     store = app.bot_data.get("store")
     if job_queue is None or not isinstance(store, SettingsStore):
         return
-    now = int(time.time())
+    changed = False
     for chat_id, settings in store.chats().items():
         for pending in settings.pending_captchas.values():
-            job_queue.run_once(
-                captcha_timeout,
-                when=max(pending.expires_at - now, 0),
-                name=_captcha_job_name(chat_id, pending.user_id),
-                data={"chat_id": chat_id, "user_id": pending.user_id, "token": pending.token},
+            if pending.phase == "verifying":
+                pending.phase = "waiting"
+                changed = True
+            _enqueue_captcha_timeout(
+                app, chat_id, pending.user_id, pending.token, pending.expires_at,
             )
+    if changed:
+        store.save()
+
+
+async def recover_missing_captcha_jobs(context: ContextTypes.DEFAULT_TYPE) -> None:
+    app = context.application
+    queue = app.job_queue
+    if queue is None:
+        return
+    active = app.bot_data.get("captcha_active", set())
+    restored = 0
+    for chat_id, settings in _store(context).chats().items():
+        for pending in list(settings.pending_captchas.values()):
+            if (chat_id, pending.user_id) in active:
+                continue
+            jobs = queue.get_jobs_by_name(_captcha_job_name(chat_id, pending.user_id))
+            if any(not job.removed and job.data and job.data.get("token") == pending.token for job in jobs):
+                continue
+            _enqueue_captcha_timeout(app, chat_id, pending.user_id, pending.token, pending.expires_at)
+            restored += 1
+    if restored:
+        LOGGER.warning("Restored %s missing CAPTCHA timeout/recovery jobs", restored)
 
 
 async def _start_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> None:
@@ -990,12 +1076,13 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
     store = _store(context)
     settings = store.chat(chat_id)
     pending = settings.pending_captchas.get(_captcha_key(user_id))
-    if pending is None or pending.token != token:
+    if pending is None or pending.token != token or pending.phase != "waiting":
         await query.answer("This CAPTCHA has expired.", show_alert=True)
         return
     if pending.expires_at <= int(time.time()):
         await query.answer("This CAPTCHA has expired.", show_alert=True)
         return
+    pending.phase = "verifying"
     try:
         await context.bot.restrict_chat_member(
             chat_id=chat_id,
@@ -1003,6 +1090,7 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
             permissions=ChatPermissions.all_permissions(),
         )
     except TelegramError:
+        pending.phase = "waiting"
         LOGGER.exception("Unable to verify user %s in chat %s", user_id, chat_id)
         await query.answer("Verification could not be completed. Please try again.", show_alert=True)
         return
@@ -1022,7 +1110,11 @@ async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_
 
 def _has_pending_captcha(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
     pending = _store(context).chat(chat_id).pending_captchas.get(_captcha_key(user_id))
-    return pending is not None and pending.expires_at > int(time.time())
+    return (
+        pending is not None
+        and pending.phase in {"waiting", "verifying"}
+        and pending.expires_at > int(time.time())
+    )
 
 
 async def scandeletedaccounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1110,6 +1202,7 @@ async def _notify_recipients(
     chat = update.effective_chat
     if chat is None:
         return
+    message_html = _alert_with_group(message_html, chat.title)
     settings = _store(context).chat(chat.id)
     private_users = context.application.bot_data.setdefault("private_users", {})
     changed = False
@@ -1181,6 +1274,13 @@ async def _notify_recipients_by_chat_id(
     chat_id: int,
     message_html: str,
 ) -> None:
+    try:
+        chat = await context.bot.get_chat(chat_id)
+        group_title = chat.title
+    except TelegramError:
+        LOGGER.warning("Unable to look up title for alert chat %s", chat_id)
+        group_title = "Unknown group"
+    message_html = _alert_with_group(message_html, group_title)
     settings = _store(context).chat(chat_id)
     private_users = context.application.bot_data.setdefault("private_users", {})
     changed = False
@@ -1226,10 +1326,12 @@ async def handle_chat_member_join(update: Update, context: ContextTypes.DEFAULT_
     change = update.chat_member
     if change is None:
         return
-    joined_statuses = {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED, *ADMIN_STATUSES}
-    if change.old_chat_member.status not in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}:
-        return
-    if change.new_chat_member.status not in joined_statuses:
+    def is_present(member) -> bool:
+        if member.status == ChatMemberStatus.RESTRICTED:
+            return member.is_member
+        return member.status in {ChatMemberStatus.MEMBER, *ADMIN_STATUSES}
+
+    if is_present(change.old_chat_member) or not is_present(change.new_chat_member):
         return
     await _handle_joined_user(update, context, change.new_chat_member.user)
 
@@ -1324,6 +1426,13 @@ def build_application(token: str, data_file: Path) -> Application:
         app.job_queue.run_repeating(scan_known_member_names, interval=interval, first=interval)
         _schedule_all_warning_jobs(app)
         _schedule_all_captcha_timeouts(app)
+        app.job_queue.run_repeating(
+            recover_missing_captcha_jobs,
+            interval=CAPTCHA_RECOVERY_INTERVAL_SECONDS,
+            first=CAPTCHA_RECOVERY_INTERVAL_SECONDS,
+            name="captcha_recovery_watchdog",
+            job_kwargs={"misfire_grace_time": None, "coalesce": True, "max_instances": 1},
+        )
     else:
         LOGGER.warning("Job queue is unavailable; periodic display-name scans are disabled.")
     return app
