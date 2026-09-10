@@ -20,13 +20,17 @@ from security_bot.storage import PendingCaptcha, SettingsStore
 
 
 def context_for(store):
+    for settings in store.chats().values():
+        settings.captcha_enabled = True
     queue = Mock()
     queue.get_jobs_by_name.return_value = []
     return SimpleNamespace(
         application=SimpleNamespace(bot_data={"store": store}, job_queue=queue),
         bot=SimpleNamespace(
+            id=999,
             ban_chat_member=AsyncMock(), unban_chat_member=AsyncMock(), delete_message=AsyncMock(),
-            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="left")),
+            restrict_chat_member=AsyncMock(),
+            get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")),
         ),
         job=SimpleNamespace(data={"chat_id": -123, "user_id": 42, "token": "test"}),
     )
@@ -132,9 +136,10 @@ def test_old_retry_does_not_delete_new_challenge(tmp_path):
 
 
 def test_restricted_nonmember_rejoin_triggers_join_handler(tmp_path):
-    update = SimpleNamespace(chat_member=SimpleNamespace(
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=-123), chat_member=SimpleNamespace(
+        from_user=SimpleNamespace(id=42),
         old_chat_member=SimpleNamespace(status="restricted", is_member=False),
-        new_chat_member=SimpleNamespace(status="restricted", is_member=True, user=Mock()),
+        new_chat_member=SimpleNamespace(status="restricted", is_member=True, user=SimpleNamespace(id=42)),
     ))
     with patch("security_bot.bot._handle_joined_user", new_callable=AsyncMock) as handler:
         asyncio.run(handle_chat_member_join(update, context_for(SettingsStore(tmp_path / "state.json"))))

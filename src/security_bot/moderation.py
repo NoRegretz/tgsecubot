@@ -7,7 +7,8 @@ from typing import Iterable
 from urllib.parse import urlparse
 
 
-EVM_ADDRESS_RE = re.compile(r"(?i)0x[a-f0-9]{40}")
+# Treat letter-O prefixes as address lookalikes, not as valid on-chain addresses.
+EVM_ADDRESS_RE = re.compile(r"(?i)[0o]x[a-f0-9]{40}")
 URL_RE = re.compile(
     r"(?i)\b((?:https?://|www\.)[^\s<>()]+|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z][a-z0-9-]{1,62}(?:/[^\s<>()]*)?)"
 )
@@ -61,8 +62,11 @@ def extract_urls(text: str) -> list[FoundUrl]:
     for match in URL_RE.finditer(text):
         raw = match.group(1).rstrip(".,;:!?)]}")
         candidate = raw if "://" in raw else f"https://{raw}"
-        parsed = urlparse(candidate)
-        host = (parsed.hostname or "").lower()
+        try:
+            parsed = urlparse(candidate)
+            host = (parsed.hostname or "").lower()
+        except ValueError:
+            continue
         if host and "." in host:
             if host.startswith("www."):
                 host = host[4:]
@@ -72,6 +76,22 @@ def extract_urls(text: str) -> list[FoundUrl]:
 
 def contains_blocked_url(text: str, allowed_domains: Iterable[str]) -> bool:
     return any(not host_allowed(found.host, allowed_domains) for found in extract_urls(text))
+
+
+def message_contains_blocked_url(message, allowed_domains: Iterable[str]) -> bool:
+    text = message.text or message.caption or ""
+    if contains_blocked_url(text, allowed_domains):
+        return True
+    for entity in tuple(message.entities or ()) + tuple(message.caption_entities or ()):
+        if entity.type != "text_link" or not entity.url:
+            continue
+        try:
+            host = urlparse(entity.url).hostname
+            if not host or not host_allowed(host, allowed_domains):
+                return True
+        except ValueError:
+            return True
+    return False
 
 
 def contains_evm_address(text: str) -> bool:

@@ -48,6 +48,19 @@ def test_contains_evm_address_detects_address_like_text():
     assert not contains_evm_address("0x1234")
 
 
+@pytest.mark.parametrize("prefix", ["0x", "0X", "Ox", "OX", "ox", "oX"])
+def test_evm_detector_includes_letter_o_prefix_lookalikes(prefix):
+    address = prefix + "ffDA10b7fd9Cf172e0502A6Bc0e5E355516c5232"
+    assert contains_evm_address(address)
+    assert contains_evm_address(f"Support {address} team")
+    assert contains_evm_address(f"User{address}")
+
+
+@pytest.mark.parametrize("text", ["O instead of 0", "Ox", "oxygen", "ox1234", "Ox" + "a" * 39, "Ox" + "g" * 40])
+def test_evm_lookalike_detection_does_not_match_ordinary_or_short_text(text):
+    assert not contains_evm_address(text)
+
+
 def test_name_matches_keywords_case_insensitive():
     assert name_matches_keywords("Meta Support", ["meta"])
     assert not name_matches_keywords("Regular User", ["meta"])

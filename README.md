@@ -2,6 +2,8 @@
 
 Telegram group moderation bot with admin-controlled URL blocking, keyword alerts, and EVM address detection.
 
+See [Functions, effects, reliability changes, and local test checklist](docs/FUNCTIONS.md) for the full behavior guide. This update preserves existing per-group settings and adds a first-save backup; new groups still have every switch OFF.
+
 ## Setup
 
 ```powershell
@@ -33,7 +35,8 @@ For private alerts, each recipient must open the bot in Telegram and send `/star
 - `/addkeyword Meta` adds a watched keyword.
 - `/listkeyword` lists watched keywords.
 - `/delkeyword Meta` removes a watched keyword.
-- `/scandelacc` scans known group members and removes deleted Telegram accounts.
+- `/scandelacc` scans known group members in background batches and reports suspected deleted accounts.
+- `/confirmdelacc user_id` confirms removal of a reported suspect; matching a name alone no longer causes automatic removal.
 - `/delca ON|OFF` removes users when they join with an EVM-like address in their displayed name. Default: OFF.
 - `/sendca ON|OFF` deletes messages containing EVM-like addresses. Default: OFF.
 - `/clearevents ON|OFF` deletes Telegram join and leave service messages. Default: OFF.
@@ -52,19 +55,25 @@ Group admins are always allowed to send URLs. Only group admins can change bot s
 
 `/clearevents ON` removes join and leave notices that Telegram sends to the bot, including CAPTCHA timeout removal notices.
 
-When CAPTCHA is enabled, new non-admin, non-bot members are muted and receive this message with their Telegram first name: `Hello {first}! Welcome to the community! Please click the button below within 60 seconds to join, otherwise you will be kicked!` They also receive a `Tap to join!` button. The displayed number of seconds follows `/captchatime`. They are restored after pressing their own button; users who do not verify before the configured time are removed. The bot must be a group admin with permission to restrict members and ban users, as well as delete messages if you want it to clean up verification messages.
+When CAPTCHA is enabled, new non-admin, non-bot members are muted and receive this message with their first name and username when available: `Hello Lev (@noregretz)! Welcome to the community! Please click the button below within 60 seconds to join, otherwise you will be kicked!` They also receive a `Tap to join!` button. The displayed time follows `/captchatime` and starts after the challenge is sent. Only their own button click is accepted. Setup and accepted verification are saved before network requests; restoration failures retry without turning an accepted click into a kick. The mute lasts until explicit restoration/removal, including during an outage. The bot needs a supergroup with restrict/ban and delete-message rights.
 
-CAPTCHA timeout removals save unfinished unban actions in the settings file and retry until a membership lookup confirms the user is no longer banned. Retries start at 10 seconds and increase to 5 minutes; longer Telegram rate-limit delays are respected. Recovery resumes after a restart. Overdue CAPTCHA jobs remain eligible to run, and a watchdog checks every 15 seconds for saved actions missing their jobs. At most three members' timeout/recovery workflows run simultaneously, with duplicate processing prevented for the same member. During a burst, removals and retries may therefore run later than their target time.
+CAPTCHA timeout removals request a temporary ban expiring 120 seconds after the removal request is prepared, then immediately request unban. The 60-second default verification window is unchanged. Telegram's scheduled ban expiry is a fallback if the bot goes offline or unban requests fail, provided Telegram accepted the timed ban. This expiry applies only to CAPTCHA removals, not delca or confirmed deleted-account removals. It does not retroactively change old bans.
 
-When updating a VPS, install the updated files and restart the bot using the same settings data file (`SECURITY_BOT_DATA` or `--data-file`). Only recorded CAPTCHA actions are recovered; the bot does not scan the banned list to unban unrelated users. Bans left by versions that discarded the recovery record need manual attention.
+Unfinished unban actions remain saved in the settings file and retry until a membership lookup confirms the user is no longer banned. Retries start at 10 seconds and increase to 5 minutes; longer Telegram rate-limit delays are respected. Unban retries do not reban users or extend the temporary ban. Recovery resumes after a restart. Overdue CAPTCHA jobs remain eligible to run, and a watchdog checks every 15 seconds for saved actions missing their jobs. At most three members' timeout/recovery workflows run simultaneously, with duplicate processing prevented for the same member. During a burst, removals and retries may run later than their target time; each temporary-ban expiry is calculated immediately before its request, not when the job was queued.
 
-Keyword alerts trigger on joins, on messages from a user whose display name changed, and on a periodic scan of users the bot has already seen in the group. The scan interval defaults to 60 seconds and can be changed with `SECURITY_BOT_NAME_SCAN_SECONDS`.
+When updating a VPS, install the updated files and restart the bot using the same settings data file (`SECURITY_BOT_DATA` or `--data-file`). Recovery applies only to recorded bot-owned actions: CAPTCHA, delca kicks, and administrator-confirmed suspect-account kicks. These reasons are kept separate. The bot does not scan the banned list to unban unrelated users, and observed external moderator bans cancel pending recovery. Bans left by versions that discarded the recovery record need manual attention. Do not run a local test instance with the production token while the VPS instance is running.
+
+Offline/startup safety: queued joins dated before startup (including its exact second), or more than 120 seconds old when handled, do not start CAPTCHA. On startup, expired saved challenges and interrupted setup/removal attempts that have not entered unban recovery are cancelled or released rather than used to kick established members. Still-valid challenges retain their original deadlines; accepted verification and unban recovery continue. During a running session, setup more than 120 seconds after a recorded join and first-time enforcement more than 120 seconds past a challenge deadline are also cancelled/released. This deliberately skips missed checks during outages or severe overload; it does not disable other moderation features or discard all queued updates.
+
+CAPTCHA cleanup is attempted immediately at timeout/release, before a timeout kick, rather than waiting for the five-second maintenance tick or successful unban. The attempt has a two-second time budget; failures remain saved for background retry without stopping unban recovery. A rapid rejoin that overlaps an old workflow is scheduled again as soon as that workflow finishes, without waiting for the watchdog. Old message cleanup and old buttons cannot affect the new challenge. API errors can still temporarily leave an expired message visible.
+
+Keyword alerts include the originating group and are queued per receiver for retry across restarts. They trigger on joins, on messages from a user whose display name changed, and on scans of known members. Scans attempt at most five lookups per five-second tick, with backoff for errors. The per-member target defaults to 60 seconds and can be changed with `SECURITY_BOT_NAME_SCAN_SECONDS`; large groups take longer to scan.
 
 `/scandelacc` can only scan users the bot already knows from joins or messages. Telegram Bot API does not provide bots with a full group member list.
 
 For `/warnmedia`, first send the image, GIF, or video in the group, then reply to that media message with `/warnmedia`. Telegram file IDs are stored, not downloaded media files.
 
-Before each scheduled warning is posted, the bot deletes the previous warning message it sent in that group.
+Before each scheduled warning is posted, the bot deletes the previous warning message it sent in that group. Failed deletion retains the ID and prevents a replacement until deletion succeeds or Telegram confirms it is already absent. Media captions are validated before saving edits. See the function guide for Telegram deletion/size limits and recovery steps.
 
 `/warningtxt` preserves new lines and Telegram text formatting such as bold, italic, links, and code. For multi-line warnings, send the command like this:
 

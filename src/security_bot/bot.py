@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime, timedelta, timezone
 import logging
 import os
 from pathlib import Path
 import secrets
 import time
 
-from telegram import Chat, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update, User
+from telegram import Chat, ChatPermissions, MessageEntity, Update, User
 from telegram.constants import ChatMemberStatus, ParseMode
-from telegram.error import BadRequest, Forbidden, TelegramError, RetryAfter
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     ChatMemberHandler,
     CommandHandler,
@@ -23,14 +23,21 @@ from telegram.ext import (
 )
 
 from .moderation import (
-    contains_blocked_url,
     contains_evm_address,
     display_name,
     escape_html,
     name_matches_keywords,
     normalize_domain,
+    message_contains_blocked_url,
 )
 from .storage import PendingCaptcha, Recipient, SavedFilter, SettingsStore
+from .diagnostics import configure_logging
+from .workflows import process_member_action, present, retry_delay, remember_cleanup, message_absent
+from .workflows import CAPTCHA_MAX_EVENT_AGE_SECONDS
+from .background import (
+    deliver_pending_alerts, flush_on_shutdown, maintenance, queue_alerts,
+    scan_deleted_batch, scan_names,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -49,7 +56,8 @@ ADMIN_COMMANDS_TEXT = """Admin Commands:
 /addkeyword Meta - add a watched keyword.
 /listkeyword - list watched keywords.
 /delkeyword Meta - remove a watched keyword.
-/scandelacc - scan known members and remove deleted Telegram accounts.
+/scandelacc - scan known members and report suspected deleted accounts.
+/confirmdelacc user_id - remove a reported account after admin review.
 /delca ON|OFF - remove users who join with an EVM-like address in their displayed name. Default: OFF.
 /sendca ON|OFF - delete messages containing EVM-like addresses. Default: OFF.
 /clearevents ON|OFF - delete join and leave service messages. Default: OFF.
@@ -180,6 +188,9 @@ async def _is_group_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return False
     if chat.type == Chat.PRIVATE:
         return False
+    message = update.effective_message
+    if message and message.sender_chat and message.sender_chat.id == chat.id:
+        return True
     try:
         member = await context.bot.get_chat_member(chat.id, user.id)
     except TelegramError:
@@ -216,6 +227,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user and user.username:
         context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
+        if update.effective_chat and update.effective_chat.type == Chat.PRIVATE:
+            store = _store(context)
+            for settings in store.chats().values():
+                recipient = settings.recipients.get(_username_key(user.username))
+                if recipient and recipient.user_id in {None, user.id}:
+                    recipient.user_id = user.id
+                    for alert in settings.pending_alerts.values():
+                        if alert.receiver == recipient.username:
+                            alert.user_id = user.id
+                            alert.next_attempt = 0
+                    store.mark_dirty()
+            store.flush()
     if update.effective_message:
         await update.effective_message.reply_text(
             "Security bot is running. Add me to a group as admin, then configure me there.\n\n"
@@ -246,6 +269,11 @@ async def url_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await toggle_command(update, context, "alert_enabled", "alert")
+    if update.effective_chat:
+        settings = _store(context).chat(update.effective_chat.id)
+        if not settings.alert_enabled and settings.pending_alerts:
+            settings.pending_alerts.clear()
+            _store(context).save()
 
 
 async def delca_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -262,6 +290,18 @@ async def clearevents_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def captcha_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await toggle_command(update, context, "captcha_enabled", "captcha")
+    chat = update.effective_chat
+    if chat is None:
+        return
+    settings = _store(context).chat(chat.id)
+    if settings.captcha_enabled:
+        return
+    for pending in settings.pending_captchas.values():
+        if pending.reason == "captcha" and pending.phase in {"provisioning", "waiting", "verifying", "kick"}:
+            pending.phase = "release"
+            pending.expires_at = int(time.time())
+            _store(context).save()
+            _schedule_captcha_timeout(context, chat.id, pending.user_id, pending.token, pending.expires_at)
 
 
 async def captchatime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -458,6 +498,8 @@ async def addrecipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     private_users = context.application.bot_data.setdefault("private_users", {})
     user_id = private_users.get(username)
     settings = _store(context).chat(chat.id)
+    if username in settings.recipients:
+        user_id = settings.recipients[username].user_id or user_id
     settings.recipients[username] = Recipient(username=username, user_id=user_id)
     _store(context).save()
     suffix = "" if user_id else " Ask this user to /start the bot once so private alerts can be delivered."
@@ -482,6 +524,7 @@ async def delrecipient(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     settings = _store(context).chat(chat.id)
     if username in settings.recipients:
         del settings.recipients[username]
+        settings.pending_alerts = {key: alert for key, alert in settings.pending_alerts.items() if alert.receiver != username}
         _store(context).save()
         await message.reply_text(f"Alert recipient removed: @{username}")
     else:
@@ -515,6 +558,9 @@ async def warningtxt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await message.reply_text("Usage: /warningtxt message")
         return
     settings = _store(context).chat(chat.id)
+    if settings.warning_media_file_id and _utf16_len(text) > 1024:
+        await message.reply_text("Warning text with media must fit within 1024 characters. Shorten the text first.")
+        return
     settings.warning_text = text
     settings.warning_entities = _shift_message_entities(message, payload_start_offset)
     _store(context).save()
@@ -577,6 +623,9 @@ async def warnmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     media_type, file_id = media
     settings = _store(context).chat(chat.id)
+    if _utf16_len(settings.warning_text) > 1024:
+        await message.reply_text("Shorten the warning text to 1024 characters before attaching media.")
+        return
     settings.warning_media_type = media_type
     settings.warning_media_file_id = file_id
     _store(context).save()
@@ -585,9 +634,8 @@ async def warnmedia(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def _filter_key(value: str) -> str:
     normalized = value.strip()
-    if normalized.startswith("/"):
+    if normalized.startswith("/") and len(normalized.split()) == 1:
         normalized = normalized[1:]
-        normalized = normalized.split(maxsplit=1)[0]
         normalized = normalized.split("@", 1)[0]
     return normalized.casefold()
 
@@ -754,6 +802,10 @@ async def _maybe_send_filter_response(update: Update, context: ContextTypes.DEFA
     text = (message.text or "").strip()
     if not text:
         return False
+    if text.startswith("/"):
+        command = text.split(maxsplit=1)[0]
+        if "@" in command and command.split("@", 1)[1].casefold() != context.bot.username.casefold():
+            return False
     saved_filter = _store(context).chat(chat.id).filters.get(_filter_key(text))
     if saved_filter is None:
         return False
@@ -770,48 +822,51 @@ async def handle_filter_command(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     if chat is None or message is None or user is None or chat.type == Chat.PRIVATE:
         return
-    if user.username:
-        context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
-    await _handle_name_seen(update, context, user, is_join=False)
-    if _has_pending_captcha(context, chat.id, user.id):
-        await _delete_message(update, "command from unverified CAPTCHA user")
-        return
     await _maybe_send_filter_response(update, context)
 
 
-async def send_warning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
-    job = context.job
-    if job is None or job.data is None:
+async def send_warning_message(context) -> None:
+    if context.job is None or context.job.data is None:
         return
-    chat_id = int(job.data["chat_id"])
+    chat_id = int(context.job.data["chat_id"])
+    data = context.application.bot_data
+    active = data.setdefault("warning_active", set())
+    if chat_id in active or data.setdefault("warning_backoff", {}).get(chat_id, 0) > time.time():
+        return
     settings = _store(context).chat(chat_id)
-    if not settings.warning_enabled:
+    if not settings.warning_enabled or not (settings.warning_text or settings.warning_media_file_id):
         return
-    if not settings.warning_text and not settings.warning_media_file_id:
+    if settings.warning_media_file_id and _utf16_len(settings.warning_text) > 1024:
+        LOGGER.error("Warning in chat %s has a caption over 1024 characters; edit /warningtxt before sending", chat_id)
         return
+    active.add(chat_id)
     try:
-        await _delete_previous_warning_messages(context, chat_id)
+        if not await _delete_previous_warning_messages(context, chat_id):
+            return
+        if not settings.warning_enabled:
+            return
         sent_message = await _send_configured_warning(context, chat_id)
         settings.warning_message_ids = [sent_message.message_id]
         _store(context).save()
-    except TelegramError:
-        LOGGER.exception("Unable to send warning message to chat %s", chat_id)
+    except TelegramError as exc:
+        data["warning_backoff"][chat_id] = int(time.time()) + retry_delay(exc, 1)
+        LOGGER.warning("Unable to send warning in chat %s: %s", chat_id, exc)
+    finally:
+        active.discard(chat_id)
 
 
-async def _delete_previous_warning_messages(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+async def _delete_previous_warning_messages(context, chat_id: int) -> bool:
     store = _store(context)
     settings = store.chat(chat_id)
-    if not settings.warning_message_ids:
-        return
-    for message_id in settings.warning_message_ids:
+    for message_id in list(settings.warning_message_ids):
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-        except BadRequest:
-            LOGGER.info("Previous warning message %s in chat %s could not be deleted.", message_id, chat_id)
-        except TelegramError:
-            LOGGER.exception("Unable to delete previous warning message %s in chat %s", message_id, chat_id)
-    settings.warning_message_ids = []
-    store.save()
+        except BadRequest as exc:
+            if not message_absent(exc):
+                raise
+        settings.warning_message_ids.remove(message_id)
+        store.save()
+    return not settings.warning_message_ids
 
 
 async def _send_configured_warning(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -928,56 +983,16 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _process_captcha_timeout(context, chat_id, user_id, token)
     finally:
         active.discard(key)
+        pending = _store(context).chat(chat_id).pending_captchas.get(str(user_id))
+        if pending is not None and pending.token != token:
+            # A rapid rejoin may have consumed its new job while the old action held this member.
+            _enqueue_captcha_timeout(context.application, chat_id, user_id, pending.token, pending.expires_at)
 
 
-async def _process_captcha_timeout(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, token: str,
-) -> None:
-    store = _store(context)
-    settings = store.chat(chat_id)
-    pending = settings.pending_captchas.get(_captcha_key(user_id))
-    if pending is None or pending.token != token:
-        return
-    if pending.expires_at > int(time.time()):
-        _schedule_captcha_timeout(context, chat_id, user_id, token, pending.expires_at)
-        return
-    if pending.phase == "verifying":
-        _schedule_captcha_timeout(context, chat_id, user_id, token, int(time.time()) + 10)
-        return
-    if pending.phase == "waiting":
-        # Persist before banning: an interrupted/ambiguous request must recover by unbanning.
-        pending.phase = "unban"
-        store.save()
-        try:
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-        except TelegramError:
-            LOGGER.exception("CAPTCHA ban failed or is uncertain for user %s in chat %s; attempting unban", user_id, chat_id)
-    try:
-        await context.bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-        member = await context.bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        LOGGER.info("CAPTCHA post-unban status for user %s in chat %s: %s", user_id, chat_id, member.status)
-        if member.status == ChatMemberStatus.BANNED:
-            raise TelegramError("User remains banned after unban request; retaining CAPTCHA recovery")
-    except TelegramError as exc:
-        if settings.pending_captchas.get(_captcha_key(user_id)) is not pending:
-            return
-        pending.retry_count += 1
-        delay = min(10 * 2 ** min(pending.retry_count - 1, 5), 300)
-        if isinstance(exc, RetryAfter):
-            retry_after = exc.retry_after
-            delay = max(delay, int(retry_after.total_seconds() if isinstance(retry_after, timedelta) else retry_after) + 1)
-        pending.expires_at = int(time.time()) + delay
-        store.save()
-        _schedule_captcha_timeout(context, chat_id, user_id, token, pending.expires_at)
-        LOGGER.exception("CAPTCHA unban failed for user %s in chat %s; retry in %s seconds", user_id, chat_id, delay)
-    else:
-        if settings.pending_captchas.get(_captcha_key(user_id)) is pending:
-            del settings.pending_captchas[_captcha_key(user_id)]
-            store.save()
-    try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=pending.message_id)
-    except TelegramError:
-        LOGGER.debug("Unable to delete expired CAPTCHA message %s in chat %s", pending.message_id, chat_id)
+async def _process_captcha_timeout(context, chat_id: int, user_id: int, token: str) -> None:
+    await process_member_action(
+        context, chat_id, user_id, token, _schedule_captcha_timeout, _captcha_welcome_text,
+    )
 
 
 def _schedule_all_captcha_timeouts(app: Application) -> None:
@@ -989,7 +1004,8 @@ def _schedule_all_captcha_timeouts(app: Application) -> None:
     for chat_id, settings in store.chats().items():
         for pending in settings.pending_captchas.values():
             if pending.phase == "verifying":
-                pending.phase = "waiting"
+                pending.phase = "release"
+                pending.expires_at = int(time.time())
                 changed = True
             _enqueue_captcha_timeout(
                 app, chat_id, pending.user_id, pending.token, pending.expires_at,
@@ -1022,155 +1038,116 @@ async def _start_captcha(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     chat = update.effective_chat
     if chat is None:
         return
-    settings = _store(context).chat(chat.id)
-    token = secrets.token_urlsafe(12)
-    expires_at = int(time.time()) + settings.captcha_timeout_seconds
-    try:
-        await chat.restrict_member(
-            user.id,
-            permissions=_captcha_permissions(),
-            until_date=datetime.now(timezone.utc) + timedelta(seconds=settings.captcha_timeout_seconds),
-        )
-        captcha_message = await context.bot.send_message(
-            chat_id=chat.id,
-            text=_captcha_welcome_text(user, settings.captcha_timeout_seconds),
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("Tap to join!", callback_data=_captcha_callback_data(chat.id, user.id, token))]]
-            ),
-        )
-    except TelegramError:
-        LOGGER.exception("Unable to start CAPTCHA for user %s in chat %s", user.id, chat.id)
+    now = int(time.time())
+    change = getattr(update, "chat_member", None)
+    joined_at = int(change.date.timestamp()) if change is not None else now
+    session_started = context.application.bot_data.get("captcha_session_started_at", 0)
+    if (change is not None and joined_at <= session_started) or now - joined_at > CAPTCHA_MAX_EVENT_AGE_SECONDS:
+        LOGGER.info("Skipping CAPTCHA for old join: chat %s user %s joined_at=%s session_started=%s", chat.id, user.id, joined_at, session_started)
         return
-
-    settings.pending_captchas[_captcha_key(user.id)] = PendingCaptcha(
-        user_id=user.id,
-        token=token,
-        message_id=captcha_message.message_id,
-        expires_at=expires_at,
+    settings = _store(context).chat(chat.id)
+    old = settings.pending_captchas.get(str(user.id))
+    if old:
+        remember_cleanup(settings, old.message_id)
+    pending = PendingCaptcha(
+        user_id=user.id, token=secrets.token_urlsafe(12), message_id=0, expires_at=int(time.time()),
+        phase="provisioning", first_name=user.first_name, username=user.username, joined_at=joined_at,
     )
+    settings.pending_captchas[str(user.id)] = pending
     _store(context).save()
-    _schedule_captcha_timeout(context, chat.id, user.id, token, expires_at)
+    _schedule_captcha_timeout(context, chat.id, user.id, pending.token, pending.expires_at)
 
 
 async def handle_captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query is None or query.from_user is None or not query.data:
+    if query is None or not isinstance(query.data, str):
         return
     parts = query.data.split("|")
-    if len(parts) != 4 or parts[0] != "captcha":
+    if len(parts) != 4:
         return
     try:
-        chat_id = int(parts[1])
-        user_id = int(parts[2])
+        chat_id, user_id = int(parts[1]), int(parts[2])
     except ValueError:
         await query.answer("Invalid CAPTCHA.", show_alert=True)
         return
-    token = parts[3]
     if query.from_user.id != user_id:
         await query.answer("This CAPTCHA is for another user.", show_alert=True)
         return
-    if query.message is None or query.message.chat_id != chat_id:
-        await query.answer("Invalid CAPTCHA.", show_alert=True)
-        return
-    store = _store(context)
-    settings = store.chat(chat_id)
-    pending = settings.pending_captchas.get(_captcha_key(user_id))
-    if pending is None or pending.token != token or pending.phase != "waiting":
+    settings = _store(context).chat(chat_id)
+    pending = settings.pending_captchas.get(str(user_id))
+    if (
+        query.message is None or query.message.chat_id != chat_id
+        or pending is None or pending.token != parts[3]
+        or query.message.message_id != pending.message_id
+        or pending.reason != "captcha"
+    ):
         await query.answer("This CAPTCHA has expired.", show_alert=True)
         return
-    if pending.expires_at <= int(time.time()):
+    if pending.phase == "release":
+        await query.answer("Verification accepted. Restoring your permissions.")
+        return
+    if pending.phase != "waiting" or (pending.deadline or pending.expires_at) <= int(time.time()):
         await query.answer("This CAPTCHA has expired.", show_alert=True)
         return
-    pending.phase = "verifying"
-    try:
-        await context.bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=ChatPermissions.all_permissions(),
-        )
-    except TelegramError:
-        pending.phase = "waiting"
-        LOGGER.exception("Unable to verify user %s in chat %s", user_id, chat_id)
-        await query.answer("Verification could not be completed. Please try again.", show_alert=True)
-        return
-
-    del settings.pending_captchas[_captcha_key(user_id)]
-    store.save()
-    job_queue = context.application.job_queue
-    if job_queue is not None:
-        for job in job_queue.get_jobs_by_name(_captcha_job_name(chat_id, user_id)):
-            job.schedule_removal()
-    await query.answer("Verified.")
-    try:
-        await query.message.delete()
-    except TelegramError:
-        LOGGER.debug("Unable to delete completed CAPTCHA message in chat %s", chat_id)
+    # Accept the click durably before making the Telegram request.
+    pending.phase = "release"
+    pending.expires_at = int(time.time())
+    _store(context).save()
+    _schedule_captcha_timeout(context, chat_id, user_id, pending.token, pending.expires_at)
+    await query.answer("Verification accepted. Restoring your permissions.")
 
 
 def _has_pending_captcha(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    pending = _store(context).chat(chat_id).pending_captchas.get(_captcha_key(user_id))
-    return (
-        pending is not None
-        and pending.phase in {"waiting", "verifying"}
-        and pending.expires_at > int(time.time())
-    )
+    pending = _store(context).chat(chat_id).pending_captchas.get(str(user_id))
+    return pending is not None and pending.reason == "captcha" and pending.phase != "unban"
 
 
-async def scandeletedaccounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def scandeletedaccounts(update, context) -> None:
     if not await _require_admin(update, context):
         return
-    chat = update.effective_chat
-    message = update.effective_message
+    chat, message = update.effective_chat, update.effective_message
     if chat is None or message is None:
         return
-    settings = _store(context).chat(chat.id)
-    known_user_ids = list(settings.known_names)
-    scanned = 0
-    removed = 0
-    stale = 0
-    skipped = 0
-
-    for user_id_raw in known_user_ids:
-        try:
-            user_id = int(user_id_raw)
-        except ValueError:
-            del settings.known_names[user_id_raw]
-            stale += 1
-            continue
-        try:
-            member = await context.bot.get_chat_member(chat_id=chat.id, user_id=user_id)
-        except TelegramError:
-            stale += 1
-            continue
-        scanned += 1
-        if member.status in {ChatMemberStatus.LEFT, ChatMemberStatus.BANNED}:
-            del settings.known_names[user_id_raw]
-            stale += 1
-            continue
-        if not _looks_like_deleted_account(member.user):
-            continue
-        if member.status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.RESTRICTED}:
-            skipped += 1
-            continue
-        try:
-            await chat.ban_member(user_id)
-            await chat.unban_member(user_id, only_if_banned=True)
-        except TelegramError:
-            LOGGER.exception("Unable to remove deleted-looking account %s from chat %s", user_id, chat.id)
-            skipped += 1
-            continue
-        del settings.known_names[user_id_raw]
-        removed += 1
-
-    _store(context).save()
-    await message.reply_text(
-        "Deleted account scan complete.\n"
-        f"Known users scanned: {scanned}\n"
-        f"Deleted accounts removed: {removed}\n"
-        f"Stale records cleaned: {stale}\n"
-        f"Skipped: {skipped}"
+    queue = context.application.job_queue
+    if queue is None:
+        await message.reply_text("Background jobs are unavailable.")
+        return
+    name = f"deleted-scan:{chat.id}"
+    if any(not job.removed for job in queue.get_jobs_by_name(name)):
+        await message.reply_text("A scan is already running.")
+        return
+    context.application.bot_data.setdefault("deleted_candidates", {})[chat.id] = set()
+    await message.reply_text("Scanning known members in the background. Suspected deleted accounts will be listed for admin confirmation; no one is removed automatically.")
+    queue.run_repeating(
+        scan_deleted_batch, interval=5, first=1, name=name,
+        data={"chat_id": chat.id, "users": list(_store(context).chat(chat.id).known_names),
+              "index": 0, "found": [], "failed": 0},
+        job_kwargs={"misfire_grace_time": None, "coalesce": True, "max_instances": 1},
     )
+
+
+async def confirm_deleted_account(update, context) -> None:
+    if not await _require_admin(update, context):
+        return
+    chat, message = update.effective_chat, update.effective_message
+    if chat is None or message is None:
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await message.reply_text("Usage: /confirmdelacc user_id")
+        return
+    uid = int(context.args[0])
+    candidates = context.application.bot_data.get("deleted_candidates", {}).get(chat.id, set())
+    if uid not in candidates:
+        await message.reply_text("This user is not a current scan candidate. Run /scandelacc first.")
+        return
+    member = await context.bot.get_chat_member(chat_id=chat.id, user_id=uid)
+    if not present(member) or member.status in ADMIN_STATUSES or not _looks_like_deleted_account(member.user):
+        candidates.discard(uid)
+        await message.reply_text("This account no longer matches a removable scan candidate.")
+        return
+    await _ban_joined_user(update, context, member.user, "confirmed-deleted")
+    candidates.discard(uid)
+    await message.reply_text("Confirmed removal queued. This is a kick with unban recovery, not a permanent ban.")
 
 
 async def _delete_message(update: Update, reason: str) -> None:
@@ -1183,122 +1160,59 @@ async def _delete_message(update: Update, reason: str) -> None:
         LOGGER.exception("Unable to delete message for reason: %s", reason)
 
 
-async def _ban_joined_user(update: Update, user: User, reason: str) -> None:
-    chat = update.effective_chat
-    if chat is None:
-        return
-    try:
-        await chat.ban_member(user.id)
-        await chat.unban_member(user.id, only_if_banned=True)
-    except TelegramError:
-        LOGGER.exception("Unable to remove user %s for reason: %s", user.id, reason)
-
-
-async def _notify_recipients(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    message_html: str,
-) -> None:
-    chat = update.effective_chat
-    if chat is None:
-        return
-    message_html = _alert_with_group(message_html, chat.title)
-    settings = _store(context).chat(chat.id)
-    private_users = context.application.bot_data.setdefault("private_users", {})
-    changed = False
-    for username, recipient in settings.recipients.items():
-        user_id = recipient.user_id or private_users.get(username)
-        if user_id is None:
-            continue
-        if recipient.user_id is None:
-            recipient.user_id = user_id
-            changed = True
-        try:
-            await context.bot.send_message(chat_id=user_id, text=message_html, parse_mode=ParseMode.HTML)
-        except (Forbidden, BadRequest):
-            LOGGER.warning("Unable to alert @%s. They may need to start the bot.", username)
-        except TelegramError:
-            LOGGER.exception("Unable to send alert to @%s", username)
-    if changed:
-        _store(context).save()
-
-
-async def _handle_name_seen(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User, is_join: bool) -> None:
+async def _ban_joined_user(update: Update, context, user: User, reason: str) -> None:
     chat = update.effective_chat
     if chat is None:
         return
     settings = _store(context).chat(chat.id)
+    old = settings.pending_captchas.get(str(user.id))
+    if old:
+        remember_cleanup(settings, old.message_id)
+    pending = PendingCaptcha(user.id, secrets.token_urlsafe(12), 0, int(time.time()), phase="kick", reason=reason)
+    settings.pending_captchas[str(user.id)] = pending
+    _store(context).save()
+    _schedule_captcha_timeout(context, chat.id, user.id, pending.token, pending.expires_at)
+
+
+async def _notify_recipients(update, context, message_html: str) -> None:
+    chat = update.effective_chat
+    if chat is not None:
+        _store(context).chat(chat.id).title = chat.title or ""
+        queue_alerts(context, chat.id, message_html)
+
+
+async def _handle_name_seen(update, context, user: User, is_join: bool) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    store = _store(context)
+    settings = store.chat(chat.id)
+    if settings.title != (chat.title or ""):
+        settings.title = chat.title or ""
+        store.mark_dirty()
     name = display_name(user.first_name, user.last_name, user.username)
     key = str(user.id)
     previous = settings.known_names.get(key)
-    settings.known_names[key] = name
-    _store(context).save()
-
+    if previous != name:
+        settings.known_names[key] = name
+        store.mark_dirty()
+    interval = context.application.bot_data.get("name_scan_interval", 60)
+    context.application.bot_data.setdefault("scan_backoff", {})[(chat.id, key)] = (int(time.time()) + interval, 0)
     if not settings.alert_enabled or not name_matches_keywords(name, settings.keywords):
         return
-    user_label = _alert_user_label(user)
+    label = _alert_user_label(user)
     if is_join:
-        await _notify_recipients(update, context, f"Be aware {user_label} joined the group")
+        queue_alerts(context, chat.id, f"Be aware {label} joined the group")
     elif previous is not None and previous != name:
-        await _notify_recipients(update, context, f"Be aware, user changed its name to {user_label}")
+        queue_alerts(context, chat.id, f"Be aware, user changed its name to {label}")
 
 
-async def scan_known_member_names(context: ContextTypes.DEFAULT_TYPE) -> None:
-    store = _store(context)
-    for chat_id, settings in store.chats().items():
-        if not settings.alert_enabled or not settings.keywords:
-            continue
-        for user_id_raw, previous in list(settings.known_names.items()):
-            try:
-                member = await context.bot.get_chat_member(chat_id=chat_id, user_id=int(user_id_raw))
-            except TelegramError:
-                LOGGER.debug("Unable to scan member %s in chat %s", user_id_raw, chat_id, exc_info=True)
-                continue
-            user = member.user
-            name = display_name(user.first_name, user.last_name, user.username)
-            if name == previous:
-                continue
-            settings.known_names[user_id_raw] = name
-            store.save()
-            if name_matches_keywords(name, settings.keywords):
-                user_label = _alert_user_label(user)
-                await _notify_recipients_by_chat_id(
-                    context,
-                    chat_id,
-                    f"Be aware, user changed its name to {user_label}",
-                )
+async def scan_known_member_names(context) -> None:
+    await scan_names(context)
 
 
-async def _notify_recipients_by_chat_id(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_html: str,
-) -> None:
-    try:
-        chat = await context.bot.get_chat(chat_id)
-        group_title = chat.title
-    except TelegramError:
-        LOGGER.warning("Unable to look up title for alert chat %s", chat_id)
-        group_title = "Unknown group"
-    message_html = _alert_with_group(message_html, group_title)
-    settings = _store(context).chat(chat_id)
-    private_users = context.application.bot_data.setdefault("private_users", {})
-    changed = False
-    for username, recipient in settings.recipients.items():
-        user_id = recipient.user_id or private_users.get(username)
-        if user_id is None:
-            continue
-        if recipient.user_id is None:
-            recipient.user_id = user_id
-            changed = True
-        try:
-            await context.bot.send_message(chat_id=user_id, text=message_html, parse_mode=ParseMode.HTML)
-        except (Forbidden, BadRequest):
-            LOGGER.warning("Unable to alert @%s. They may need to start the bot.", username)
-        except TelegramError:
-            LOGGER.exception("Unable to send alert to @%s", username)
-    if changed:
-        _store(context).save()
+async def _notify_recipients_by_chat_id(context, chat_id: int, message_html: str) -> None:
+    queue_alerts(context, chat_id, message_html)
 
 
 async def _handle_joined_user(update: Update, context: ContextTypes.DEFAULT_TYPE, user: User) -> None:
@@ -1310,7 +1224,7 @@ async def _handle_joined_user(update: Update, context: ContextTypes.DEFAULT_TYPE
     if user.username:
         context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
     if settings.delca_enabled and contains_evm_address(name):
-        await _ban_joined_user(update, user, "EVM-like display name")
+        await _ban_joined_user(update, context, user, "delca")
         return
     await _handle_name_seen(update, context, user, is_join=True)
     if (
@@ -1326,14 +1240,31 @@ async def handle_chat_member_join(update: Update, context: ContextTypes.DEFAULT_
     change = update.chat_member
     if change is None:
         return
-    def is_present(member) -> bool:
-        if member.status == ChatMemberStatus.RESTRICTED:
-            return member.is_member
-        return member.status in {ChatMemberStatus.MEMBER, *ADMIN_STATUSES}
-
-    if is_present(change.old_chat_member) or not is_present(change.new_chat_member):
+    chat = update.effective_chat
+    member = change.new_chat_member
+    settings = _store(context).chat(chat.id)
+    pending = settings.pending_captchas.get(str(member.user.id))
+    external_action = change.from_user.id != context.bot.id
+    override = external_action and (
+        member.status == ChatMemberStatus.BANNED
+        or (present(change.old_chat_member) and member.status in {ChatMemberStatus.RESTRICTED, *ADMIN_STATUSES})
+        or (change.old_chat_member.status == ChatMemberStatus.RESTRICTED and member.status == ChatMemberStatus.MEMBER)
+    )
+    departure = not present(member) and member.status != ChatMemberStatus.BANNED
+    if pending and (override or (departure and pending.phase != "unban")):
+        remember_cleanup(settings, pending.message_id)
+        del settings.pending_captchas[str(member.user.id)]
+        _store(context).save()
+        if context.application.job_queue:
+            for job in context.application.job_queue.get_jobs_by_name(_captcha_job_name(chat.id, member.user.id)):
+                job.schedule_removal()
+        LOGGER.info("Member action cancelled for chat %s user %s after external action/departure", chat.id, member.user.id)
+    if not present(member):
+        settings.known_names.pop(str(member.user.id), None)
+        _store(context).mark_dirty()
+    if present(change.old_chat_member) or not present(member):
         return
-    await _handle_joined_user(update, context, change.new_chat_member.user)
+    await _handle_joined_user(update, context, member.user)
 
 
 async def clear_event_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1346,43 +1277,89 @@ async def clear_event_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await message.delete()
     except TelegramError:
+        remember_cleanup(_store(context).chat(chat.id), message.message_id)
+        _store(context).save()
         LOGGER.exception("Unable to delete membership service message in chat %s", chat.id)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat
-    message = update.effective_message
-    user = update.effective_user
-    if chat is None or message is None or user is None or chat.type == Chat.PRIVATE:
-        return
-    if user.username:
-        context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
-    await _handle_name_seen(update, context, user, is_join=False)
-    if _has_pending_captcha(context, chat.id, user.id):
-        await _delete_message(update, "message from unverified CAPTCHA user")
-        return
-    if await _maybe_send_filter_response(update, context):
-        return
+    await _maybe_send_filter_response(update, context)
 
+
+async def moderation_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat, message, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat is None or message is None:
+        return
+    if user and user.username:
+        context.application.bot_data.setdefault("private_users", {})[_username_key(user.username)] = user.id
     settings = _store(context).chat(chat.id)
-    if await _is_group_admin(update, context):
-        return
     text = message.text or message.caption or ""
-    if settings.sendca_enabled and contains_evm_address(text):
-        await _delete_message(update, "EVM address in message")
-        return
-    if settings.url_enabled and contains_blocked_url(text, settings.allowed_urls):
-        await _delete_message(update, "blocked URL")
+    pending = user is not None and _has_pending_captcha(context, chat.id, user.id)
+    blocked = (
+        (settings.sendca_enabled and contains_evm_address(text))
+        or (settings.url_enabled and message_contains_blocked_url(message, settings.allowed_urls))
+    )
+    if pending or blocked:
+        anonymous_admin = message.sender_chat is not None and message.sender_chat.id == chat.id
+        try:
+            admin = anonymous_admin or (
+                message.sender_chat is None and user is not None
+                and (await context.bot.get_chat_member(chat.id, user.id)).status in ADMIN_STATUSES
+            )
+        except TelegramError:
+            LOGGER.warning("Unable to verify moderator exemption in chat %s; message left for admin review", chat.id)
+            raise ApplicationHandlerStop
+        if not admin:
+            try:
+                await message.delete()
+            except TelegramError:
+                remember_cleanup(settings, message.message_id)
+                _store(context).save()
+            raise ApplicationHandlerStop
+    if user and message.sender_chat is None:
+        await _handle_name_seen(update, context, user, is_join=False)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    LOGGER.exception("Unhandled bot error. update=%r", update, exc_info=context.error)
+    LOGGER.error("Unhandled bot error. update_id=%s", getattr(update, "update_id", None), exc_info=context.error)
+
+
+async def initialize_captcha_session(app: Application) -> None:
+    # run_polling calls post_init before starting update processing or scheduled jobs.
+    now = int(time.time())
+    app.bot_data["captcha_session_started_at"] = now
+    store = app.bot_data["store"]
+    changed = False
+    for settings in store.chats().values():
+        for uid, pending in list(settings.pending_captchas.items()):
+            if pending.reason != "captcha":
+                continue
+            expired = pending.phase == "waiting" and (pending.deadline or pending.expires_at) <= now
+            if pending.phase == "provisioning" and pending.restore_permissions is None:
+                remember_cleanup(settings, pending.message_id)
+                del settings.pending_captchas[uid]
+                changed = True
+            elif expired or pending.phase in {"provisioning", "kick", "verifying"}:
+                pending.phase = "release"
+                pending.expires_at = now
+                changed = True
+    if changed:
+        store.save()
+        LOGGER.info("Reconciled interrupted/expired CAPTCHA challenges for startup; unban recovery preserved")
+    _schedule_all_captcha_timeouts(app)
 
 
 def build_application(token: str, data_file: Path) -> Application:
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(initialize_captcha_session).post_shutdown(flush_on_shutdown).build()
     app.bot_data["store"] = SettingsStore(data_file)
+    app.bot_data["captcha_session_started_at"] = int(time.time())
     app.bot_data["private_users"] = {}
+    try:
+        app.bot_data["name_scan_interval"] = max(10, int(os.getenv("SECURITY_BOT_NAME_SCAN_SECONDS", "60")))
+    except ValueError:
+        app.bot_data["name_scan_interval"] = 60
+        LOGGER.warning("Invalid SECURITY_BOT_NAME_SCAN_SECONDS; using 60 seconds")
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, moderation_gate), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("url", url_command))
@@ -1410,6 +1387,7 @@ def build_application(token: str, data_file: Path) -> Application:
     app.add_handler(CommandHandler("delreceiver", delrecipient))
     app.add_handler(CommandHandler("listreceiver", listrecipient))
     app.add_handler(CommandHandler("scandelacc", scandeletedaccounts))
+    app.add_handler(CommandHandler("confirmdelacc", confirm_deleted_account))
     app.add_handler(CallbackQueryHandler(handle_captcha_callback, pattern=r"^captcha\|"))
     app.add_handler(ChatMemberHandler(handle_chat_member_join, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(
@@ -1422,10 +1400,10 @@ def build_application(token: str, data_file: Path) -> Application:
     app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     if app.job_queue is not None:
-        interval = int(os.getenv("SECURITY_BOT_NAME_SCAN_SECONDS", "60"))
-        app.job_queue.run_repeating(scan_known_member_names, interval=interval, first=interval)
+        app.job_queue.run_repeating(scan_known_member_names, interval=5, first=5)
+        app.job_queue.run_repeating(deliver_pending_alerts, interval=5, first=5)
+        app.job_queue.run_repeating(maintenance, interval=5, first=5)
         _schedule_all_warning_jobs(app)
-        _schedule_all_captcha_timeouts(app)
         app.job_queue.run_repeating(
             recover_missing_captcha_jobs,
             interval=CAPTCHA_RECOVERY_INTERVAL_SECONDS,
@@ -1451,7 +1429,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
     args = parse_args()
     if not args.token:
         raise SystemExit("Missing bot token. Set TELEGRAM_BOT_TOKEN or pass --token.")

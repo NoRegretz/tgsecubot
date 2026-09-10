@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import os
 from pathlib import Path
 import tempfile
 from threading import RLock
@@ -31,6 +32,22 @@ class PendingCaptcha:
     expires_at: int
     phase: str = "waiting"
     retry_count: int = 0
+    deadline: int = 0
+    first_name: str = "there"
+    username: str | None = None
+    reason: str = "captcha"
+    restore_permissions: dict[str, Any] | None = None
+    restore_until: int = 0
+    joined_at: int = 0
+
+
+@dataclass
+class PendingAlert:
+    receiver: str
+    text: str
+    user_id: int | None = None
+    next_attempt: int = 0
+    attempts: int = 0
 
 
 @dataclass
@@ -56,6 +73,9 @@ class ChatSettings:
     filters: dict[str, SavedFilter] = field(default_factory=dict)
     known_names: dict[str, str] = field(default_factory=dict)
     pending_captchas: dict[str, PendingCaptcha] = field(default_factory=dict)
+    pending_alerts: dict[str, PendingAlert] = field(default_factory=dict)
+    cleanup_message_ids: list[int] = field(default_factory=list)
+    title: str = ""
 
 
 class SettingsStore:
@@ -63,6 +83,8 @@ class SettingsStore:
         self.path = path
         self._lock = RLock()
         self._data: dict[str, ChatSettings] = {}
+        self._dirty = False
+        self._backup_source: bytes | None = None
         self._load()
 
     def chat(self, chat_id: int) -> ChatSettings:
@@ -70,7 +92,7 @@ class SettingsStore:
         with self._lock:
             if key not in self._data:
                 self._data[key] = ChatSettings()
-                self.save()
+                self.mark_dirty()
             return self._data[key]
 
     def chats(self) -> dict[int, ChatSettings]:
@@ -80,17 +102,36 @@ class SettingsStore:
     def save(self) -> None:
         with self._lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if self._backup_source is not None:
+                backup = self.path.with_name(self.path.name + ".pre-reliability.bak")
+                try:
+                    with backup.open("xb") as stream:
+                        stream.write(self._backup_source)
+                except FileExistsError:
+                    pass
+                self._backup_source = None
             payload = {chat_id: asdict(settings) for chat_id, settings in self._data.items()}
             with tempfile.NamedTemporaryFile("w", delete=False, dir=self.path.parent, encoding="utf-8") as tmp:
                 json.dump(payload, tmp, indent=2, sort_keys=True)
                 tmp.write("\n")
+                tmp.flush()
+                os.fsync(tmp.fileno())
                 tmp_path = Path(tmp.name)
             tmp_path.replace(self.path)
+            self._dirty = False
+
+    def mark_dirty(self) -> None:
+        self._dirty = True
+
+    def flush(self) -> None:
+        if self._dirty:
+            self.save()
 
     def _load(self) -> None:
         if not self.path.exists():
             return
-        raw: dict[str, Any] = json.loads(self.path.read_text(encoding="utf-8"))
+        original = self.path.read_bytes()
+        raw: dict[str, Any] = json.loads(original.decode("utf-8"))
         for chat_id, value in raw.items():
             recipients = {
                 username: Recipient(**recipient)
@@ -126,4 +167,8 @@ class SettingsStore:
                 filters=saved_filters,
                 known_names=dict(value.get("known_names", {})),
                 pending_captchas=pending_captchas,
+                pending_alerts={key: PendingAlert(**item) for key, item in value.get("pending_alerts", {}).items()},
+                cleanup_message_ids=list(value.get("cleanup_message_ids", [])),
+                title=str(value.get("title", "")),
             )
+        self._backup_source = original
